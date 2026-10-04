@@ -1,0 +1,28 @@
+diff --git a/scripts/utils/class_memory.py b/scripts/utils/class_memory.py
+index 8887f15..8a334e0 100644
+--- a/scripts/utils/class_memory.py
++++ b/scripts/utils/class_memory.py
+@@ -23,7 +23,13 @@ class Memory:
+     self.depth          = int(sram_data['depth'])
+     self.num_banks      = int(sram_data['banks'])
+     self.cache_type     = str(sram_data['type']) if 'type' in sram_data else 'cache'
+-    self.rw_ports       = 1
++    # 'ports': '1rw' (default) or '1r1w' (one read and one write port, CACTI
++    # exclusive read and write ports) -- added for the GDF stage macros
++    self.ports          = str(sram_data['ports']) if 'ports' in sram_data else '1rw'
++    assert self.ports in ('1rw', '1r1w'), self.ports
++    self.rw_ports       = 1 if self.ports == '1rw' else 0
++    self.r_ports        = 1 if self.ports == '1r1w' else 0
++    self.w_ports        = 1 if self.ports == '1r1w' else 0
+     self.width_in_bytes = math.ceil(self.width_in_bits / 8.0)
+     self.total_size     = self.width_in_bytes * self.depth
+     if output_dir: # Output dir was set by command line option
+@@ -79,7 +85,7 @@ class Memory:
+   def __run_cacti( self ):
+     fid = open(os.sep.join([self.results_dir,'cacti.cfg']), 'w')
+     fid.write( cacti_config.format( self.total_size
+-             , self.width_in_bytes, self.rw_ports, 0, 0
++             , self.width_in_bytes, self.rw_ports, self.r_ports, self.w_ports
+              , self.process.tech_um, self.width_in_bytes*8, self.num_banks
+              , self.cache_type ))
+     fid.close()

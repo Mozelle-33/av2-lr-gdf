@@ -1,0 +1,24 @@
+# Yosys synthesis for place and route with the SRAM macros: the same recipe as
+# synth_pnr.ys (Booth multipliers, abc -D 2500 with sizing, ORFS dont-use
+# cells, tie cells, no assign statements), but the RAMs are fakeram45 macro
+# instances (asic/pnr/mem_macros.v, asic/macros/gen_gdf_macros.py) inside the
+# netlist and the two ROMs are synthesized into standard cells.  Run from
+# rtl/, which holds the ROM contents (pcw_class.hex, pcw_sel.hex).
+read_verilog @OUT@/gdf_core_nomem.v
+read_verilog -defer /mnt/g/AV2/asic/pnr/mem_macros.v
+# @ROMV@
+read_verilog -lib @MACROS_BB@
+chparam -set MAXCH 1024 -set AW 10 -set MSTG 1 -set MACF 0 -set IDXF 0 -set LA 1 -set VS @VS@ -set FIP @FIP@ -set PCW @PCW@ -set LR @LR@ -set CH @CH@ gdf_core
+hierarchy -check -top gdf_core
+synth -top gdf_core -flatten -booth
+delete t:$scopeinfo
+dfflibmap -liberty @LIB@
+abc -D @DELAY@ -liberty @LIB@ -script +strash;&get,-n;&fraig,-x;&put;scorr;dc2;dretime;strash;&get,-n;&dch,-f;&nf,-D,@DELAY@;&put;buffer;upsize,-D,@DELAY@;dnsize,-D,@DELAY@;stime,-p
+opt_clean -purge
+setundef -zero
+hilomap -singleton -hicell LOGIC1_X1 Z -locell LOGIC0_X1 Z
+opt_clean -purge
+insbuf -buf BUF_X1 A Z
+opt_clean -purge
+tee -o @OUT@/stat.txt stat -liberty @LIB@ @MACROS_LIBOPT@
+write_verilog -noattr -noexpr -nohex -nodec @OUT@/netlist.v

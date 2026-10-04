@@ -1,0 +1,894 @@
+diff --git a/av2/common/gdf.c b/av2/common/gdf.c
+index 78d8d6f..b30e368 100644
+--- a/av2/common/gdf.c
++++ b/av2/common/gdf.c
+@@ -9,11 +9,172 @@
+  * source code in the PATENTS file, you can obtain it at
+  * aomedia.org/license/patent-license/.
+  */
++#if TCAS_INSTR && !defined(_POSIX_C_SOURCE)
++#define _POSIX_C_SOURCE 200809L  // clock_gettime() for the instrumentation
++#endif
+ #ifndef AVM_COMMON_GDF_H_
+ #define AVM_COMMON_GDF_H_
+ 
+ #include "av2/common/gdf.h"
+ #include "av2/common/gdf_block.h"
++#include "av2/common/tcas_instr.h"
++
++#if TCAS_INSTR
++#include <stdlib.h>
++#include <time.h>
++double tcas_now(void) {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
++}
++double tcas_time[TCAS_T_NUM];
++long tcas_frames;
++FILE *tcas_gdf_dump;
++static FILE *tcas_gdfoff_dump;  // units with GDF off (same record layout)
++FILE *tcas_pcw_dump;
++FILE *tcas_lr_dump;
++FILE *tcas_lrc_dump;
++FILE *tcas_lrcoff_dump;  // chroma restoration units with LR off
++int tcas_timing_on;
++static long tcas_dump_max_frames = -1;
++static long tcas_gdf_frame_idx = -1;
++
++static const char *const tcas_names[TCAS_T_NUM] = {
++  "tiles(entropy+recon)", "deblocking",       "cdef",
++  "ccso",                 "gdf_copy_guided",  "loop_restoration",
++  "gdf_total",            "  gdf_lap_cls",    "  gdf_inference",
++  "  gdf_compensation",   "wrapup_total"
++};
++
++static void tcas_report(void) {
++  if (tcas_gdf_dump) {
++    fclose(tcas_gdf_dump);
++    tcas_gdf_dump = NULL;
++  }
++  if (tcas_gdfoff_dump) {
++    fclose(tcas_gdfoff_dump);
++    tcas_gdfoff_dump = NULL;
++  }
++  if (tcas_pcw_dump) {
++    fclose(tcas_pcw_dump);
++    tcas_pcw_dump = NULL;
++  }
++  if (tcas_lr_dump) {
++    fclose(tcas_lr_dump);
++    tcas_lr_dump = NULL;
++  }
++  if (tcas_lrc_dump) {
++    fclose(tcas_lrc_dump);
++    tcas_lrc_dump = NULL;
++  }
++  if (tcas_lrcoff_dump) {
++    fclose(tcas_lrcoff_dump);
++    tcas_lrcoff_dump = NULL;
++  }
++  if (!tcas_timing_on) return;
++  const double tot = tcas_time[TCAS_T_WRAPUP];
++  fprintf(stderr, "[tcas] frames: %ld\n", tcas_frames);
++  for (int i = 0; i < TCAS_T_NUM; i++) {
++    fprintf(stderr, "[tcas] %-22s %10.3f ms %7.2f %%\n", tcas_names[i],
++            1e3 * tcas_time[i], tot > 0 ? 100.0 * tcas_time[i] / tot : 0.0);
++  }
++}
++
++void tcas_instr_init(void) {
++  static int inited = 0;
++  if (inited) return;
++  inited = 1;
++  const char *t = getenv("AVM_STAGE_TIMING");
++  tcas_timing_on = t && atoi(t) > 0;
++  const char *d = getenv("AVM_GDF_DUMP");
++  if (d && *d) {
++    tcas_gdf_dump = fopen(d, "wb");
++    if (!tcas_gdf_dump) fprintf(stderr, "[tcas] cannot open %s\n", d);
++  }
++  const char *go = getenv("AVM_GDFOFF_DUMP");
++  if (go && *go) {
++    tcas_gdfoff_dump = fopen(go, "wb");
++    if (!tcas_gdfoff_dump) fprintf(stderr, "[tcas] cannot open %s\n", go);
++  }
++  const char *pw = getenv("AVM_PCW_DUMP");
++  if (pw && *pw) {
++    tcas_pcw_dump = fopen(pw, "wb");
++    if (!tcas_pcw_dump) fprintf(stderr, "[tcas] cannot open %s\n", pw);
++  }
++  const char *lr = getenv("AVM_LR_DUMP");
++  if (lr && *lr) {
++    tcas_lr_dump = fopen(lr, "wb");
++    if (!tcas_lr_dump) fprintf(stderr, "[tcas] cannot open %s\n", lr);
++  }
++  const char *lrc = getenv("AVM_LRC_DUMP");
++  if (lrc && *lrc) {
++    tcas_lrc_dump = fopen(lrc, "wb");
++    if (!tcas_lrc_dump) fprintf(stderr, "[tcas] cannot open %s\n", lrc);
++  }
++  const char *lrco = getenv("AVM_LRCOFF_DUMP");
++  if (lrco && *lrco) tcas_lrcoff_dump = fopen(lrco, "wb");
++  const char *m = getenv("AVM_GDF_DUMP_MAXFRAMES");
++  if (m && *m) tcas_dump_max_frames = atol(m);
++  atexit(tcas_report);
++}
++
++static uint16_t *tcas_copy_unit(const uint16_t *rec, int stride, int i_min,
++                                int i_max, int j_min, int j_max) {
++  const int h = i_max - i_min, w = j_max - j_min;
++  uint16_t *buf = (uint16_t *)malloc(sizeof(*buf) * h * w);
++  for (int r = 0; r < h; r++)
++    memcpy(buf + r * w, rec + (i_min + r) * stride + j_min, sizeof(*buf) * w);
++  return buf;
++}
++
++static void tcas_dump_unit(const AV2_COMMON *cm, int i_min, int i_max,
++                           int j_min, int j_max, int qp_idx, int ref_dst_idx,
++                           int pxl_shift, int scale_val, int err_shift,
++                           const uint16_t *lr_copy) {
++  // lr_copy == NULL: unit with GDF off (AVM_GDFOFF_DUMP), expected error 0
++  // and LR output = final output
++  const int h = i_max - i_min, w = j_max - j_min;
++  const int apron = GDF_TEST_EXTRA_VER_BORDER;
++  const int32_t hdr[16] = { (int32_t)tcas_gdf_frame_idx,
++                            (int32_t)cm->current_frame.display_order_hint,
++                            cm->cur_frame->buf.y_width,
++                            cm->cur_frame->buf.y_height,
++                            cm->cur_frame->buf.bit_depth,
++                            i_min,
++                            i_max,
++                            j_min,
++                            j_max,
++                            qp_idx,
++                            ref_dst_idx,
++                            pxl_shift,
++                            scale_val,
++                            err_shift,
++                            cm->features.has_lossless_segment,
++                            apron };
++  FILE *f = lr_copy ? tcas_gdf_dump : tcas_gdfoff_dump;
++  fwrite("GDFU", 1, 4, f);
++  fwrite(hdr, sizeof(hdr), 1, f);
++  const int s = cm->gdf_info.inp_stride;
++  for (int r = i_min - apron; r < i_max + apron; r++)
++    fwrite(cm->gdf_info.inp_ptr + r * s + j_min - apron, sizeof(uint16_t),
++           w + 2 * apron, f);
++  const uint16_t *rec = cm->cur_frame->buf.buffers[AVM_PLANE_Y];
++  const int rs = cm->cur_frame->buf.y_stride;
++  if (lr_copy) {
++    for (int r = 0; r < h; r++)
++      fwrite(cm->gdf_info.err_ptr + r * cm->gdf_info.err_stride,
++             sizeof(int16_t), w, f);
++    fwrite(lr_copy, sizeof(uint16_t), (size_t)h * w, f);
++  } else {
++    const int16_t zero = 0;
++    for (int k = 0; k < h * w; k++) fwrite(&zero, sizeof(zero), 1, f);
++    for (int r = i_min; r < i_max; r++)
++      fwrite(rec + r * rs + j_min, sizeof(uint16_t), w, f);
++  }
++  for (int r = i_min; r < i_max; r++)
++    fwrite(rec + r * rs + j_min, sizeof(uint16_t), w, f);
++}
++#endif  // TCAS_INSTR
+ 
+ static int gdf_num_stripes_in_tile(int stripe_size, int tile_size) {
+   const int first_stripe_offset = GDF_TEST_STRIPE_OFF;
+@@ -532,6 +693,13 @@ void gdf_filter_frame(AV2_COMMON *cm) {
+ 
+   if (cm->bru.frame_inactive_flag) return;
+   if (cm->bridge_frame_info.is_bridge_frame) return;
++#if TCAS_INSTR
++  tcas_instr_init();
++  tcas_gdf_frame_idx++;
++  const int tcas_dump_this_frame =
++      tcas_gdf_dump != NULL &&
++      (tcas_dump_max_frames < 0 || tcas_gdf_frame_idx < tcas_dump_max_frames);
++#endif
+   const int bit_depth = cm->cur_frame->buf.bit_depth;
+   const int pxl_max = (1 << cm->cur_frame->buf.bit_depth) - 1;
+   const int pxl_shift =
+@@ -635,6 +803,7 @@ void gdf_filter_frame(AV2_COMMON *cm) {
+                 }
+                 for (int qp_idx = qp_idx_min; qp_idx < qp_idx_max_plus_1;
+                      qp_idx++) {
++                  TCAS_TIC(tcas_t_lap);
+                   gdf_set_lap_and_cls_unit(
+                       i_min, i_max, j_min, j_max,
+                       cm->gdf_info.inp_ptr +
+@@ -642,6 +811,8 @@ void gdf_filter_frame(AV2_COMMON *cm) {
+                       cm->gdf_info.inp_stride, bit_depth, cm->gdf_info.lap_ptr,
+                       cm->gdf_info.lap_stride, cm->gdf_info.cls_ptr,
+                       cm->gdf_info.cls_stride);
++                  TCAS_TOC(TCAS_T_GDF_LAP, tcas_t_lap);
++                  TCAS_TIC(tcas_t_inf);
+                   gdf_inference_unit(
+                       i_min, i_max, j_min, j_max, qp_idx,
+                       cm->gdf_info.inp_ptr + cm->gdf_info.inp_stride * i_min +
+@@ -650,6 +821,15 @@ void gdf_filter_frame(AV2_COMMON *cm) {
+                       cm->gdf_info.lap_stride, cm->gdf_info.cls_ptr,
+                       cm->gdf_info.cls_stride, cm->gdf_info.err_ptr,
+                       cm->gdf_info.err_stride, pxl_shift, ref_dst_idx);
++                  TCAS_TOC(TCAS_T_GDF_INF, tcas_t_inf);
++#if TCAS_INSTR
++                  uint16_t *tcas_lr =
++                      tcas_dump_this_frame
++                          ? tcas_copy_unit(rec_pnt, rec_stride, i_min, i_max,
++                                           j_min, j_max)
++                          : NULL;
++#endif
++                  TCAS_TIC(tcas_t_comp);
+                   // If there is at-least 1 segment is lossless in a frame, we
+                   // have to do 4x4 processing, because minimum lossless block
+                   // can be 4x4 size. Although, regardless the value of
+@@ -699,8 +879,28 @@ void gdf_filter_frame(AV2_COMMON *cm) {
+                                           scale_val, pxl_max, i_max - i_min,
+                                           j_max - j_min);
+                   }
++                  TCAS_TOC(TCAS_T_GDF_COMP, tcas_t_comp);
++#if TCAS_INSTR
++                  if (tcas_lr) {
++                    tcas_dump_unit(cm, i_min, i_max, j_min, j_max, qp_idx,
++                                   ref_dst_idx, pxl_shift, scale_val, err_shift,
++                                   tcas_lr);
++                    free(tcas_lr);
++                  }
++#endif
+                 }
+               }
++#if TCAS_INSTR
++              else if (tcas_gdfoff_dump != NULL && i_max > i_min &&
++                       j_max > j_min &&
++                       (tcas_dump_max_frames < 0 ||
++                        tcas_gdf_frame_idx < tcas_dump_max_frames)) {
++                // unit with GDF off (block flag or local mode)
++                tcas_dump_unit(cm, i_min, i_max, j_min, j_max, qp_idx_min,
++                               ref_dst_idx, pxl_shift, scale_val, err_shift,
++                               NULL);
++              }
++#endif
+               gdf_restore_processing_stripe_leftright_boundary(
+                   &cm->gdf_info, i_min, i_max, j_min, j_max, tile_boundary_left,
+                   tile_boundary_right);
+diff --git a/av2/common/restoration.c b/av2/common/restoration.c
+index e996946..88ac801 100644
+--- a/av2/common/restoration.c
++++ b/av2/common/restoration.c
+@@ -22,11 +22,18 @@
+ #include "av2/common/bru.h"
+ #include "av2/common/resize.h"
+ #include "av2/common/restoration.h"
++#include "av2/common/tcas_instr.h"
+ #include "avm_dsp/avm_dsp_common.h"
+ #include "avm_mem/avm_mem.h"
+ 
+ #include "avm_ports/mem.h"
+ 
++#if TCAS_INSTR
++// frames with cross-component chroma LR so far, minus one: counted at stripe 0
++// of the down-sampled luma, as the readers of the LRSL records count them
++static int tcas_lrc_frame = -1;
++#endif
++
+ /* clang-format off */
+ 
+ #define AVM_WIENERNS_COEFF(p, b, m, k) \
+@@ -1170,6 +1177,28 @@ void apply_pc_wiener_highbd(
+ 
+     rotate_feature_line_buffers(feature_length, buffers);
+   }
++#if TCAS_INSTR
++  // TCAS study: one record per luma processing unit (see tcas_instr.h)
++  if (tcas_pcw_dump && !is_uv) {
++    const int bv = 3, bh = 4;
++    const int mi_rows = (height + 3) >> 2, mi_cols = (width + 3) >> 2;
++    const int32_t hdr[12] = {
++      width, height, bit_depth, tskip_zero_flag, classify_only,
++      buffers->prev_qindex, bv, bh, mi_rows, mi_cols,
++      cm ? (int32_t)cm->current_frame.display_order_hint : -1, 0
++    };
++    FILE *f = tcas_pcw_dump;
++    fwrite("PCWU", 1, 4, f);
++    fwrite(hdr, sizeof(hdr), 1, f);
++    for (int r = -bv; r < height + bv; r++)
++      fwrite(dgd + r * stride - bh, sizeof(uint16_t), width + 2 * bh, f);
++    for (int r = 0; r < mi_rows; r++)
++      fwrite(tskip + r * tskip_stride, 1, mi_cols, f);
++    for (int r = 0; r < mi_rows; r++)
++      fwrite(wiener_class_id + r * wiener_class_id_stride, 1, mi_cols, f);
++    fwrite(buffers->qval_given_tskip_lut, sizeof(int32_t), 256 * 4, f);
++  }
++#endif  // TCAS_INSTR
+ }
+ 
+ static void setup_qval_tskip_lut(int qindex, int qindex_offset, int bit_depth,
+@@ -1787,6 +1816,37 @@ uint16_t *wienerns_copy_luma_with_virtual_lines(struct AV2Common *cm,
+       av2_highbd_resize_plane(dgd, height_y, width_y, in_stride, *luma,
+                               height_uv, width_uv, out_stride, bd);
+ #endif  // WIENERNS_CROSS_FILT_LUMA_TYPE
++#if TCAS_INSTR && WIENERNS_CROSS_FILT_LUMA_TYPE == 2
++      // TCAS study: luma rows read by the down-sampler of this stripe, and
++      // its output (see tcas_instr.h, "LRSL")
++      if (frame_stripe == 0) tcas_lrc_frame++;
++      if (tcas_lrc_dump) {
++        const int32_t lh[16] = { (int32_t)cm->current_frame.display_order_hint,
++                                 frame_stripe,
++                                 y0,
++                                 y1,
++                                 width_y,
++                                 height_y,
++                                 width_uv,
++                                 height_uv,
++                                 ds_type,
++                                 ss_x,
++                                 ss_y,
++                                 h_uv,
++                                 y0 > 0,
++                                 y1 < height_y,
++                                 (int32_t)cm->seq_params.bit_depth,
++                                 0 };
++        fwrite("LRSL", 1, 4, tcas_lrc_dump);
++        fwrite(lh, sizeof(lh), 1, tcas_lrc_dump);
++        for (int r = 0; r < 2 * h_uv; ++r)
++          fwrite(curr_dgd + r * in_stride, sizeof(uint16_t), 2 * width_uv,
++                 tcas_lrc_dump);
++        for (int r = 0; r < h_uv; ++r)
++          fwrite(curr_luma + r * out_stride, sizeof(uint16_t), width_uv,
++                 tcas_lrc_dump);
++      }
++#endif  // TCAS_INSTR
+ 
+       restore_processing_stripe_boundary(&remaining_stripes, cm->rlbs, h, dgd,
+                                          in_stride, copy_above, copy_below,
+@@ -1985,6 +2045,205 @@ static const stripe_filter_fun stripe_filters[NUM_STRIPE_FILTERS] = {
+ };
+ 
+ // Filter one restoration unit
++#if TCAS_INSTR
++// TCAS study: one record per luma LR stripe of a restoration unit, taken
++// after the stripe filter while the stripe borders are still in place (see
++// tcas_instr.h).
++static void tcas_dump_lr_stripe(const RestorationUnitInfo *rui, int rtype,
++                                int width, int height, int procunit_width,
++                                const uint16_t *src, int src_stride,
++                                const uint16_t *dst, int dst_stride,
++                                int bit_depth, int v_start, int h_start,
++                                const PcwienerBuffers *pcb) {
++  const int bv = 4, bh = 4;
++  const int mi_rows = (height + 3) >> 2, mi_cols = (width + 3) >> 2;
++  const int n_pu = (width + procunit_width - 1) / procunit_width;
++  const AV2_COMMON *cm = rui->cm;
++  const int32_t hdr[24] = {
++    rtype,
++    width,
++    height,
++    procunit_width,
++    bit_depth,
++    rui->base_qindex,
++    rui->qindex_offset,
++    get_filter_set_index(rui->base_qindex, rui->qindex_offset),
++    rui->wienerns_info.num_classes,
++    rui->skip_pcwiener_filtering,
++    rui->tskip_zero_flag,
++    cm ? (int32_t)cm->current_frame.display_order_hint : -1,
++    v_start,
++    h_start,
++    bv,
++    bh,
++    mi_rows,
++    mi_cols,
++    n_pu,
++    rui->wiener_class_id_restrict,
++    rui->compute_classification,
++    cm ? cm->cur_frame->buf.y_width : -1,
++    cm ? cm->cur_frame->buf.y_height : -1,
++    cm ? cm->features.has_lossless_segment : -1
++  };
++  FILE *f = tcas_lr_dump;
++  fwrite("LRSU", 1, 4, f);
++  fwrite(hdr, sizeof(hdr), 1, f);
++  const int mi_offset_y =
++      AVMMIN(height - 1, RESTORATION_UNIT_OFFSET) >> (MI_SIZE_LOG2 - rui->ss_y);
++  for (int p = 0; p < n_pu; p++) {
++    const int mi_offset_x =
++        (p * procunit_width) >> (MI_SIZE_LOG2 - rui->ss_x);
++    const int32_t t =
++        rui->mbmi_ptr[mi_offset_x + mi_offset_y * rui->mi_stride]
++            ->local_rest_type;
++    fwrite(&t, sizeof(t), 1, f);
++  }
++  for (int r = -bv; r < height + bv; r++)
++    fwrite(src + r * src_stride - bh, sizeof(uint16_t), width + 2 * bh, f);
++  static const uint8_t zeros[1024];
++  for (int r = 0; r < mi_rows; r++) {
++    if (rui->tskip)
++      fwrite(rui->tskip + r * rui->tskip_stride, 1, mi_cols, f);
++    else
++      fwrite(zeros, 1, mi_cols, f);
++  }
++  for (int r = 0; r < mi_rows; r++) {
++    if (rui->wiener_class_id)
++      fwrite(rui->wiener_class_id + r * rui->wiener_class_id_stride, 1,
++             mi_cols, f);
++    else
++      fwrite(zeros, 1, mi_cols, f);
++  }
++  fwrite(pcb->qval_given_tskip_lut, sizeof(int32_t), 256 * 4, f);
++  fwrite(rui->wienerns_info.allfiltertaps, sizeof(int16_t),
++         WIENERNS_MAX_CLASSES * WIENERNS_TAPS_MAX, f);
++  for (int r = 0; r < height; r++)
++    fwrite(dst + r * dst_stride, sizeof(uint16_t), width, f);
++  (void)bit_depth;
++}
++
++// TCAS study: one record per chroma LR stripe of a restoration unit (the
++// cross-component Wiener-NS), with the down-sampled luma as the filter reads it
++// (see tcas_instr.h, "LRSC").
++static void tcas_dump_lrc_stripe(const RestorationUnitInfo *rui, int rtype,
++                                 int width, int height, int procunit_width,
++                                 const uint16_t *src, int src_stride,
++                                 const uint16_t *dst, int dst_stride,
++                                 int bit_depth, int v_start, int h_start) {
++  // the chroma stripe buffer holds the +-2 rows and columns of the filter
++  const int bv = 2, bh = 2, lb = WIENERNS_UV_BRD;
++  const int n_pu = (width + procunit_width - 1) / procunit_width;
++  const AV2_COMMON *cm = rui->cm;
++  const int32_t hdr[24] = {
++    rui->plane,
++    rtype,
++    width,
++    height,
++    procunit_width,
++    bit_depth,
++    rui->base_qindex,
++    rui->qindex_offset,
++    cm ? (int32_t)cm->current_frame.display_order_hint : -1,
++    v_start,
++    h_start,
++    bv,
++    bh,
++    lb,
++    n_pu,
++    cm ? cm->cur_frame->buf.uv_width : -1,
++    cm ? cm->cur_frame->buf.uv_height : -1,
++    rui->ss_x,
++    rui->ss_y,
++    cm ? cm->seq_params.cfl_ds_filter_index : -1,
++    cm ? cm->features.has_lossless_segment : -1,
++    rui->wienerns_info.num_classes,
++    rui->luma != NULL,
++    0
++  };
++  FILE *f = tcas_lrc_dump;
++  fwrite("LRSC", 1, 4, f);
++  fwrite(hdr, sizeof(hdr), 1, f);
++  const int mi_offset_y =
++      AVMMIN(height - 1, RESTORATION_UNIT_OFFSET) >> (MI_SIZE_LOG2 - rui->ss_y);
++  for (int p = 0; p < n_pu; p++) {
++    const int mi_offset_x =
++        (p * procunit_width) >> (MI_SIZE_LOG2 - rui->ss_x);
++    const int32_t t =
++        rui->mbmi_ptr[mi_offset_x + mi_offset_y * rui->mi_stride]
++            ->local_rest_type;
++    fwrite(&t, sizeof(t), 1, f);
++  }
++  for (int r = -bv; r < height + bv; r++)
++    fwrite(src + r * src_stride - bh, sizeof(uint16_t), width + 2 * bh, f);
++  static const uint16_t zeros16[4096];
++  for (int r = -lb; r < height + lb; r++) {
++    if (rui->luma)
++      fwrite(rui->luma + r * rui->luma_stride - lb, sizeof(uint16_t),
++             width + 2 * lb, f);
++    else
++      fwrite(zeros16, sizeof(uint16_t), width + 2 * lb, f);
++  }
++  fwrite(rui->wienerns_info.allfiltertaps, sizeof(int16_t), WIENERNS_TAPS_MAX,
++         f);
++  for (int r = 0; r < height; r++)
++    fwrite(dst + r * dst_stride, sizeof(uint16_t), width, f);
++}
++
++// TCAS study: a chroma restoration unit stripe with LR off (RESTORE_NONE), as
++// an "LRSC" record of AVM_LRCOFF_DUMP with rtype 0, has_luma 0, zero luma
++// and taps, the frame samples around the unit (not the stripe buffer: rows
++// beyond the stripe are unused) and, in the last header word, the index of
++// the frame (tcas_lrc_frame).
++static void tcas_dump_lrc_none(const RestorationUnitInfo *rui, int width,
++                               int height, int procunit_width,
++                               const uint16_t *src, int src_stride,
++                               const uint16_t *dst, int dst_stride,
++                               int bit_depth, int v_start, int h_start,
++                               int ss_x, int ss_y) {
++  const int bv = 2, bh = 2, lb = WIENERNS_UV_BRD;
++  const int n_pu = (width + procunit_width - 1) / procunit_width;
++  const AV2_COMMON *cm = rui->cm;
++  const int32_t hdr[24] = {
++    rui->plane,
++    0,
++    width,
++    height,
++    procunit_width,
++    bit_depth,
++    rui->base_qindex,
++    rui->qindex_offset,
++    cm ? (int32_t)cm->current_frame.display_order_hint : -1,
++    v_start,
++    h_start,
++    bv,
++    bh,
++    lb,
++    n_pu,
++    cm ? cm->cur_frame->buf.uv_width : -1,
++    cm ? cm->cur_frame->buf.uv_height : -1,
++    ss_x,
++    ss_y,
++    cm ? cm->seq_params.cfl_ds_filter_index : -1,
++    cm ? cm->features.has_lossless_segment : -1,
++    1,
++    0,
++    tcas_lrc_frame
++  };
++  FILE *f = tcas_lrcoff_dump;
++  static const uint16_t zeros16[4096];
++  fwrite("LRSC", 1, 4, f);
++  fwrite(hdr, sizeof(hdr), 1, f);
++  fwrite(zeros16, sizeof(int32_t), n_pu, f);
++  for (int r = -bv; r < height + bv; r++)
++    fwrite(src + r * src_stride - bh, sizeof(uint16_t), width + 2 * bh, f);
++  for (int r = -lb; r < height + lb; r++)
++    fwrite(zeros16, sizeof(uint16_t), width + 2 * lb, f);
++  fwrite(zeros16, sizeof(int16_t), WIENERNS_TAPS_MAX, f);
++  for (int r = 0; r < height; r++)
++    fwrite(dst + r * dst_stride, sizeof(uint16_t), width, f);
++}
++#endif  // TCAS_INSTR
++
+ void av2_loop_restoration_filter_unit(
+     const RestorationTileLimits *limits, const RestorationUnitInfo *rui,
+     const RestorationStripeBoundaries *rsb, RestorationLineBuffers *rlbs,
+@@ -2138,6 +2397,17 @@ void av2_loop_restoration_filter_unit(
+ 
+     stripe_filter(tmp_rui, unit_w, h, procunit_width, data_stripe_tl, stride,
+                   dst_stripe_tl, dst_stride, bit_depth);
++#if TCAS_INSTR
++    if (tcas_lr_dump && rui->plane == AVM_PLANE_Y)
++      tcas_dump_lr_stripe(tmp_rui, unit_rtype, unit_w, h, procunit_width,
++                          data_stripe_tl, stride, dst_stripe_tl, dst_stride,
++                          bit_depth, limits->v_start + i, limits->h_start,
++                          &pc_wiener_buffers);
++    if (tcas_lrc_dump && rui->plane != AVM_PLANE_Y)
++      tcas_dump_lrc_stripe(tmp_rui, unit_rtype, unit_w, h, procunit_width,
++                           data_stripe_tl, stride, dst_stripe_tl, dst_stride,
++                           bit_depth, limits->v_start + i, limits->h_start);
++#endif  // TCAS_INSTR
+ 
+     if (tile_boundary_left || tile_boundary_right) {
+       // Deallocate the allocated tmp buffers and reassign from backup
+@@ -2575,6 +2845,14 @@ static void for_each_restoration_unit(RestorationTileLimits *limits,
+ 
+   if (unit_rtype == RESTORE_NONE) {
+     copy_tile(lru_width, stripe_height, data_tl, stride, dst_tl, dst_stride);
++#if TCAS_INSTR
++    if (tcas_lrcoff_dump && tmp_rui.plane != AVM_PLANE_Y)
++      tcas_dump_lrc_none(&tmp_rui, lru_width, stripe_height,
++                         RESTORATION_PROC_UNIT_SIZE >> ss_x, data_tl, stride,
++                         dst_tl, dst_stride, ctxt->bit_depth,
++                         limits->v_start + start_height, limits->h_start, ss_x,
++                         ss_y);
++#endif  // TCAS_INSTR
+     return;
+   }
+ 
+@@ -2685,6 +2963,19 @@ static void for_each_restoration_unit(RestorationTileLimits *limits,
+ 
+   stripe_filter(&tmp_rui, lru_width, stripe_height, procunit_width, data_buf,
+                 new_stride, dst_tl, dst_stride, ctxt->bit_depth);
++#if TCAS_INSTR
++  if (tcas_lr_dump && tmp_rui.plane == AVM_PLANE_Y)
++    tcas_dump_lr_stripe(&tmp_rui, unit_rtype, lru_width, stripe_height,
++                        procunit_width, data_buf, new_stride, dst_tl,
++                        dst_stride, ctxt->bit_depth,
++                        limits->v_start + start_height, limits->h_start,
++                        &pc_wiener_buffers);
++  if (tcas_lrc_dump && tmp_rui.plane != AVM_PLANE_Y)
++    tcas_dump_lrc_stripe(&tmp_rui, unit_rtype, lru_width, stripe_height,
++                         procunit_width, data_buf, new_stride, dst_tl,
++                         dst_stride, ctxt->bit_depth,
++                         limits->v_start + start_height, limits->h_start);
++#endif  // TCAS_INSTR
+ 
+   if (tile_boundary_left || tile_boundary_right) {
+     // Deallocate the allocated tmp buffers and reassign from backup
+diff --git a/av2/common/tcas_instr.h b/av2/common/tcas_instr.h
+new file mode 100644
+index 0000000..b8de1e9
+--- /dev/null
++++ b/av2/common/tcas_instr.h
+@@ -0,0 +1,133 @@
++/*
++ * Instrumentation for the LR/GDF hardware study (not part of AVM).
++ *
++ * Compiled in only when TCAS_INSTR is defined (build with
++ * -DCMAKE_C_FLAGS=-DTCAS_INSTR=1). At run time it is controlled by:
++ *   AVM_STAGE_TIMING=1      print per-stage decoder timing at exit (stderr)
++ *   AVM_GDF_DUMP=<path>     write one record per GDF processing unit
++ *   AVM_GDF_DUMP_MAXFRAMES  only dump the first N frames that use GDF
++ *   AVM_GDFOFF_DUMP=<path>  the units of those frames with GDF off (block
++ *                           flag or local mode), same record layout with
++ *                           err = 0 and lr = out
++ *
++ * Dump record layout (little endian), see analysis/gdf_dump.py:
++ *   char     magic[4] = "GDFU"
++ *   int32    header[16] = { frame_idx, order_hint, frame_w, frame_h,
++ *                           bit_depth, i_min, i_max, j_min, j_max,
++ *                           qp_idx, ref_dst_idx, pxl_shift, scale_val,
++ *                           err_shift, has_lossless, apron }
++ *   uint16   win[(h + 2*apron) * (w + 2*apron)]  guided input incl. apron
++ *   int16    err[h * w]                          expected error (pre-scale)
++ *   uint16   lr[h * w]                           LR output (before GDF)
++ *   uint16   out[h * w]                          final output (after GDF)
++ * with h = i_max - i_min and w = j_max - j_min.
++ *
++ *   AVM_PCW_DUMP=<path>     write one record per luma PC-Wiener processing
++ *                           unit (LR), see analysis/pcw_dump.py:
++ *   char     magic[4] = "PCWU"
++ *   int32    header[12] = { width, height, bit_depth, tskip_zero_flag,
++ *                           classify_only, qindex (base + offset),
++ *                           border_v, border_h, mi_rows, mi_cols,
++ *                           frame_order_hint, reserved }
++ *   uint16   dgd[(height + 2*border_v) * (width + 2*border_h)]
++ *   uint8    tskip[mi_rows * mi_cols]            transform-skip flags
++ *   uint8    class_id[mi_rows * mi_cols]         PC-Wiener class per 4x4
++ *   int32    qval_lut[256 * 4]                   qval_given_tskip_lut
++ * with mi_rows = ceil(height / 4) and mi_cols = ceil(width / 4).
++ *
++ *   AVM_LR_DUMP=<path>      write one record per luma LR stripe of a
++ *                           restoration unit (PC-Wiener or Wiener-NS), taken
++ *                           right after the stripe filter, see
++ *                           analysis/lr_golden.py:
++ *   char     magic[4] = "LRSU"
++ *   int32    header[24] = { rtype, width, height, procunit_width, bit_depth,
++ *                           base_qindex, qindex_offset, set_index,
++ *                           num_classes, skip_pcwiener_filtering,
++ *                           tskip_zero_flag, order_hint, v_start, h_start,
++ *                           border_v, border_h, mi_rows, mi_cols, n_pu,
++ *                           class_id_restrict, compute_classification,
++ *                           frame_w, frame_h, has_lossless_segment }
++ *   int32    pu_type[n_pu]                        local_rest_type per PU
++ *   uint16   dgd[(height + 2*border_v) * (width + 2*border_h)]
++ *   uint8    tskip[mi_rows * mi_cols]
++ *   uint8    class_id[mi_rows * mi_cols]
++ *   int32    qval_lut[256 * 4]
++ *   int16    taps[16 * 32]                        Wiener-NS taps per class
++ *   uint16   dst[height * width]                  LR output
++ *
++ *   AVM_LRC_DUMP=<path>     chroma LR (cross-component Wiener-NS), two
++ *                           record types, see analysis/lrc_golden.py:
++ *   char     magic[4] = "LRSC"   one per chroma LR stripe of a restoration
++ *                                unit, right after the stripe filter
++ *   int32    header[24] = { plane, rtype, width, height, procunit_width,
++ *                           bit_depth, base_qindex, qindex_offset,
++ *                           order_hint, v_start, h_start, border_v,
++ *                           border_h, luma_border, n_pu, frame_w, frame_h,
++ *                           ss_x, ss_y, ds_type, has_lossless_segment,
++ *                           num_classes, has_luma, reserved }
++ *   int32    pu_type[n_pu]                        local_rest_type per PU
++ *   uint16   dgd[(height + 2*border_v) * (width + 2*border_h)]
++ *   uint16   luma[(height + 2*luma_border) * (width + 2*luma_border)]
++ *                                                 down-sampled luma as used
++ *   int16    taps[32]                             Wiener-NS taps (class 0)
++ *   uint16   dst[height * width]                  LR output
++ *   char     magic[4] = "LRSL"   one per luma stripe of the down-sampled
++ *                                luma of cross-component Wiener-NS
++ *   int32    header[16] = { order_hint, frame_stripe, y0, y1, width_y,
++ *                           height_y, width_uv, height_uv, ds_type, ss_x,
++ *                           ss_y, h_uv, above, below, bit_depth, reserved }
++ *   uint16   src[(2*h_uv) * (2*width_uv)]         luma rows read, starting
++ *                                                 at y0 - 4*above
++ *   uint16   ds[h_uv * width_uv]                  down-sampled rows
++ *
++ *   AVM_LRCOFF_DUMP=<path>  the chroma restoration unit stripes with LR off
++ *                           (RESTORE_NONE) of the frames with chroma LR, as
++ *                           "LRSC" records with rtype 0, has_luma 0, zero
++ *                           luma and taps, dgd = the frame samples around
++ *                           the unit, dst = dgd, and reserved = the index of
++ *                           the frame: the number of LRSL records with
++ *                           frame_stripe 0 before it, minus one
++ */
++#ifndef AVM_AV2_COMMON_TCAS_INSTR_H_
++#define AVM_AV2_COMMON_TCAS_INSTR_H_
++
++#if TCAS_INSTR
++#include <stdio.h>
++
++enum {
++  TCAS_T_TILES,       // entropy decoding + reconstruction
++  TCAS_T_DEBLOCK,     // deblocking
++  TCAS_T_CDEF,        // CDEF
++  TCAS_T_CCSO,        // CCSO (incl. padded-copy preparation)
++  TCAS_T_GDF_COPY,    // copy of the GDF guided frame
++  TCAS_T_LR,          // loop restoration (incl. boundary line saving)
++  TCAS_T_GDF,         // GDF filtering (av2_gdf_frame_dec)
++  TCAS_T_GDF_LAP,     //   gradients + classes
++  TCAS_T_GDF_INF,     //   feature extraction + MAC + table lookup
++  TCAS_T_GDF_COMP,    //   scaling + clipping + write-back
++  TCAS_T_WRAPUP,      // whole av2_decode_tg_tiles_and_wrapup
++  TCAS_T_NUM
++};
++
++extern double tcas_time[TCAS_T_NUM];
++extern long tcas_frames;
++extern FILE *tcas_gdf_dump;
++extern FILE *tcas_pcw_dump;
++extern FILE *tcas_lr_dump;
++extern FILE *tcas_lrc_dump;
++extern FILE *tcas_lrcoff_dump;
++extern int tcas_timing_on;
++
++void tcas_instr_init(void);
++// Monotonic time in seconds (defined in gdf.c, which enables POSIX
++// declarations; AVM itself is compiled as strict C11).
++double tcas_now(void);
++
++#define TCAS_TIC(v) const double v = tcas_now()
++#define TCAS_TOC(stage, v) (tcas_time[(stage)] += tcas_now() - (v))
++#else
++#define TCAS_TIC(v)
++#define TCAS_TOC(stage, v)
++#endif  // TCAS_INSTR
++
++#endif  // AVM_AV2_COMMON_TCAS_INSTR_H_
+diff --git a/av2/decoder/decodeframe.c b/av2/decoder/decodeframe.c
+index 404d59f..b15062b 100644
+--- a/av2/decoder/decodeframe.c
++++ b/av2/decoder/decodeframe.c
+@@ -47,6 +47,7 @@
+ #include "av2/common/cdef.h"
+ 
+ #include "av2/common/gdf.h"
++#include "av2/common/tcas_instr.h"
+ 
+ #include "av2/common/ccso.h"
+ #include "av2/common/cfl.h"
+@@ -9831,6 +9832,10 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+ #if CONFIG_COLLECT_COMPONENT_TIMING
+   start_timing(pbi, av2_decode_tg_tiles_and_wrapup_time);
+ #endif
++#if TCAS_INSTR
++  tcas_instr_init();
++#endif
++  TCAS_TIC(tcas_t_wrap);
+ 
+   AV2_COMMON *const cm = &pbi->common;
+   CommonTileParams *const tiles = &cm->tiles;
+@@ -9856,6 +9861,7 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+       AVM_DEC_BORDER_IN_PIXELS, cm->features.byte_alignment, NULL, NULL, NULL,
+       false);
+ #endif  // CONFIG_INSPECTION
++  TCAS_TIC(tcas_t_tiles);
+   if (pbi->max_threads > 1 && pbi->row_mt)
+     *p_data_end =
+         decode_tiles_row_mt(pbi, data, data_end, start_tile, end_tile);
+@@ -9863,6 +9869,7 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+     *p_data_end = decode_tiles_mt(pbi, data, data_end, start_tile, end_tile);
+   else
+     *p_data_end = decode_tiles(pbi, data, data_end, start_tile, end_tile);
++  TCAS_TOC(TCAS_T_TILES, tcas_t_tiles);
+ 
+   // If the bit stream is monochrome, set the U and V buffers to a constant.
+   if (num_planes < 3) {
+@@ -9913,6 +9920,7 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+   }
+ 
+   if (!cm->bru.frame_inactive_flag) {
++    TCAS_TIC(tcas_t_db);
+     if (cm->lf.apply_deblocking_filter[0] ||
+         cm->lf.apply_deblocking_filter[1]) {
+       if (pbi->num_workers > 1) {
+@@ -9928,7 +9936,9 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+                            cm->current_frame.display_order_hint, num_planes, 0);
+ #endif
+     }
++    TCAS_TOC(TCAS_T_DEBLOCK, tcas_t_db);
+ 
++    TCAS_TIC(tcas_t_ccso_prep);
+     const int use_ccso =
+         !pbi->skip_loop_filter && !cm->features.coded_lossless &&
+         (cm->ccso_info.ccso_enable[0] || cm->ccso_info.ccso_enable[1] ||
+@@ -9951,6 +9961,7 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+       }
+       extend_ccso_border(&cm->cur_frame->buf, ext_rec_y, CCSO_PADDING_SIZE);
+     }
++    TCAS_TOC(TCAS_T_CCSO, tcas_t_ccso_prep);
+ 
+     const int do_loop_restoration =
+         cm->rst_info[0].frame_restoration_type != RESTORE_NONE ||
+@@ -9967,6 +9978,7 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+         !use_ccso && !do_cdef;
+ 
+     if (!optimized_loop_restoration) {
++      TCAS_TIC(tcas_t_lr0);
+       if (do_loop_restoration)
+         av2_loop_restoration_save_boundary_lines(&pbi->common.cur_frame->buf,
+                                                  cm, 0);
+@@ -9974,7 +9986,9 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+         if (do_gdf)
+           save_tile_row_boundary_lines(&pbi->common.cur_frame->buf, 0, cm, 0);
+       }
++      TCAS_TOC(TCAS_T_LR, tcas_t_lr0);
+ 
++      TCAS_TIC(tcas_t_cdef);
+       if (do_cdef) {
+         if (pbi->num_workers > 1 &&
+             !cm->seq_params.disable_loopfilters_across_tiles) {
+@@ -9986,10 +10000,12 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+                          av2_cdef_init_fb_row);
+         }
+       }
++      TCAS_TOC(TCAS_T_CDEF, tcas_t_cdef);
+ #if CONFIG_MISMATCH_DEBUG
+       mismatch_check_frame(&pbi->common.cur_frame->buf,
+                            cm->current_frame.display_order_hint, num_planes, 1);
+ #endif
++      TCAS_TIC(tcas_t_ccso);
+       if (use_ccso) {
+         if (pbi->num_workers > 1 &&
+             !cm->seq_params.disable_loopfilters_across_tiles) {
+@@ -10000,13 +10016,17 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+         }
+         avm_free(ext_rec_y);
+       }
++      TCAS_TOC(TCAS_T_CCSO, tcas_t_ccso);
+ #if CONFIG_MISMATCH_DEBUG
+       mismatch_check_frame(&pbi->common.cur_frame->buf,
+                            cm->current_frame.display_order_hint, num_planes, 2);
+ #endif
++      TCAS_TIC(tcas_t_gcopy);
+       if (do_gdf) {
+         gdf_copy_guided_frame(cm);
+       }
++      TCAS_TOC(TCAS_T_GDF_COPY, tcas_t_gcopy);
++      TCAS_TIC(tcas_t_lr);
+       if (do_loop_restoration) {
+         av2_loop_restoration_save_boundary_lines(&pbi->common.cur_frame->buf,
+                                                  cm, 1);
+@@ -10033,6 +10053,8 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+                              3);
+ #endif
+       }
++      TCAS_TOC(TCAS_T_LR, tcas_t_lr);
++      TCAS_TIC(tcas_t_gdf);
+       if (do_gdf) {
+         av2_gdf_frame_dec(cm);
+ #if CONFIG_MISMATCH_DEBUG
+@@ -10042,8 +10064,10 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+ #endif
+         gdf_free_guided_frame(cm);
+       }
++      TCAS_TOC(TCAS_T_GDF, tcas_t_gdf);
+ 
+     } else {
++      TCAS_TIC(tcas_t_lr_opt);
+       if (do_loop_restoration) {
+         copy_frame_filters_to_runits_if_needed(cm);
+         if (pbi->num_workers > 1 &&
+@@ -10063,6 +10087,7 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+                              3);
+ #endif
+       }
++      TCAS_TOC(TCAS_T_LR, tcas_t_lr_opt);
+     }
+ 
+     if (!pbi->dcb.corrupted) {
+@@ -10099,6 +10124,10 @@ void av2_decode_tg_tiles_and_wrapup(AV2Decoder *pbi, const uint8_t *data,
+             beginningFrameFlag[i][j][k][l][h] = 1;
+ #endif
+ 
++  TCAS_TOC(TCAS_T_WRAPUP, tcas_t_wrap);
++#if TCAS_INSTR
++  tcas_frames++;
++#endif
+ #if CONFIG_COLLECT_COMPONENT_TIMING
+   end_timing(pbi, av2_decode_tg_tiles_and_wrapup_time);
+ #endif

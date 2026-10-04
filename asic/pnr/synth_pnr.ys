@@ -1,0 +1,29 @@
+# Yosys synthesis for place and route (same recipe as asic/synth_yosys.ys:
+# Booth multipliers, abc -D 2500 with sizing), with two differences:
+#  * the SRAM instances (line/column buffers, error tables) are removed and
+#    their pins become top-level ports (expose -evert); the SRAMs are hard
+#    macros outside the placed logic, their timing is in the SDC;
+#  * the ORFS Nangate45 dont-use cells are excluded, tie cells are inserted
+#    and the netlist has no assign statements.
+read_verilog /mnt/g/AV2/rtl/gdf_core.v
+chparam -set MAXCH 1024 -set AW 10 -set MSTG 1 -set MACF 0 -set IDXF 0 -set LA 1 -set VS @VS@ -set FIP @FIP@ -set PCW @PCW@ -set LR @LR@ -set CH @CH@ gdf_core
+hierarchy -check -top gdf_core
+# black-box the derived (parameterised) SRAM and ROM modules so the exposed
+# ports get the instance widths, not the module defaults
+blackbox *gdf_ram_sdp* *gdf_ram_lut* *gdf_rom_pcw* *gdf_rom_sel*
+# flatten first, so that the memories of submodules (the PC-Wiener unit) are
+# cells of the top module and get top-level ports too
+flatten
+expose -evert t:*gdf_ram_sdp* t:*gdf_ram_lut* t:*gdf_rom_pcw* t:*gdf_rom_sel*
+synth -top gdf_core -flatten -booth
+delete t:$scopeinfo
+dfflibmap -liberty @LIB@
+abc -D @DELAY@ -liberty @LIB@ -script +strash;&get,-n;&fraig,-x;&put;scorr;dc2;dretime;strash;&get,-n;&dch,-f;&nf,-D,@DELAY@;&put;buffer;upsize,-D,@DELAY@;dnsize,-D,@DELAY@;stime,-p
+opt_clean -purge
+setundef -zero
+hilomap -singleton -hicell LOGIC1_X1 Z -locell LOGIC0_X1 Z
+opt_clean -purge
+insbuf -buf BUF_X1 A Z
+opt_clean -purge
+tee -o @OUT@/stat.txt stat -liberty @LIB@
+write_verilog -noattr -noexpr -nohex -nodec @OUT@/netlist.v

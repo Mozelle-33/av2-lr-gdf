@@ -1,0 +1,10 @@
+# Port list of gdf_core with its memories turned inside out: the memory
+# modules become black boxes and their ports appear as ports of the core, as
+# in the synthesis for place and route (synth_pnr.ys).  @VS@ stands for the
+# value of the parameter VS (0 or 1) and is replaced before the script runs.
+read_verilog /mnt/g/AV2/rtl/gdf_core.v
+chparam -set MAXCH 1024 -set AW 10 -set MSTG 1 -set VS @VS@ gdf_core
+hierarchy -check -top gdf_core
+blackbox *gdf_ram_sdp* *gdf_ram_lut*
+expose -evert t:*gdf_ram_sdp* t:*gdf_ram_lut*
+tee -o /root/work/pnr/test_portlist_@VS@.txt portlist gdf_core

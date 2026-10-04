@@ -1,0 +1,13 @@
+# Yosys ASIC synthesis of gdf_core (logic only; line buffers and LUT tables
+# are SRAM macros and kept as black boxes).  Nangate45 typical corner.
+# Run through asic/run_asic.sh, which substitutes the parameters and the delay target.
+read_verilog /mnt/g/AV2/rtl/gdf_core.v
+blackbox gdf_ram_sdp gdf_ram_lut gdf_rom_pcw gdf_rom_sel
+chparam -set MAXCH @MAXCH@ -set AW @AW@ -set FULL @FULL@ -set MSTG @MSTG@ gdf_core
+hierarchy -check -top gdf_core
+synth -top gdf_core -flatten @BOOTH@
+dfflibmap -liberty /root/work/asic/NangateOpenCellLibrary_typical.lib
+abc -D @DELAY@ -liberty /root/work/asic/NangateOpenCellLibrary_typical.lib -script +strash;&get,-n;&fraig,-x;&put;scorr;dc2;dretime;strash;&get,-n;&dch,-f;&nf,-D,@DELAY@;&put;buffer;upsize,-D,@DELAY@;dnsize,-D,@DELAY@;stime,-p
+opt_clean
+tee -o @OUT@/stat.txt stat -liberty /root/work/asic/NangateOpenCellLibrary_typical.lib
+write_verilog -noattr @OUT@/gdf_core_netlist.v

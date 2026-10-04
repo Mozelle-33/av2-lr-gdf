@@ -1,0 +1,6 @@
+# Verilog simulation models of the Nangate45 cells, from the liberty
+# functions (combinational) and ff/latch groups (sequential).
+read_liberty -ignore_miss_func /root/work/pnr/orfs/flow/platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib
+proc
+opt_clean
+write_verilog -noattr /root/work/pnr/gl/nangate45_cells.v

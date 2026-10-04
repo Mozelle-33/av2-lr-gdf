@@ -1,0 +1,11 @@
+# Hierarchical variant of synth_yosys.ys (gdf_mul kept as a module) for an
+# area breakdown: multipliers vs. the rest.  Booth multipliers, MSTG = 1.
+read_verilog /mnt/g/AV2/rtl/gdf_core.v
+blackbox gdf_ram_sdp gdf_ram_lut
+chparam -set MAXCH 1024 -set AW 10 -set FULL @FULL@ -set MSTG 1 gdf_core
+hierarchy -check -top gdf_core
+synth -top gdf_core -booth
+dfflibmap -liberty /root/work/asic/NangateOpenCellLibrary_typical.lib
+abc -D 2500 -liberty /root/work/asic/NangateOpenCellLibrary_typical.lib
+opt_clean
+tee -o @OUT@/stat_hier.txt stat -liberty /root/work/asic/NangateOpenCellLibrary_typical.lib
